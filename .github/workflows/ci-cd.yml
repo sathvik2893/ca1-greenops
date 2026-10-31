@@ -1,0 +1,380 @@
+# One pipeline for the whole application.
+# CI (pushes to main and pull requests): backend tests, frontend build, static
+# and security analysis and Terraform validation, each run only when its part
+# changed; the security analysis always runs.
+# CD (push to main only, after every CI job passes): Terraform apply, release
+# upload to S3, install on EC2 through SSM and a smoke test on the public URL.
+name: CI/CD
+
+# Commits that only touch documentation, the report or the video cannot change
+# the application, so they do not start the pipeline at all.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["docs/**", "report/**", "video/**", "**/*.md"]
+  pull_request:
+    paths-ignore: ["docs/**", "report/**", "video/**", "**/*.md"]
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: "Deploy this release bundle already in S3 instead of packaging the commit (empty = normal run)"
+        required: false
+        default: ""
+
+# A newer commit on the same pull request makes the older run redundant.
+# Runs on main are never cancelled so a deployment is not cut off half way.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+  TERRAFORM_VERSION: "1.15.8"
+  AWS_REGION: us-west-2
+  # Not a secret: used only to stop a deploy if the credentials belong to another account.
+  EXPECTED_AWS_ACCOUNT_ID: "257383311061"
+  SUMMARY: python3 scripts/ci/scan_summary.py
+
+jobs:
+  # Lists the files changed by the push or pull request, so each test job runs
+  # only when its own part changed. The security scan always runs, because a
+  # new advisory can affect code that did not change.
+  changes:
+    name: "CI: detect changed parts"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      backend: ${{ steps.parts.outputs.backend }}
+      frontend: ${{ steps.parts.outputs.frontend }}
+      infra: ${{ steps.parts.outputs.infra }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: parts
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # A manual run, a new branch or a missing base checks every part.
+          if [ "$EVENT" = pull_request ]; then from=$BASE; else from=$BEFORE; fi
+          if [ "$EVENT" = workflow_dispatch ] || ! git cat-file -e "$from^{commit}" 2>/dev/null; then
+            files=ALL
+          else
+            files=$(git diff --name-only "$from" HEAD)
+          fi
+          echo "$files"
+          # The workflow and the CI scripts belong to every part.
+          part() {
+            [ "$files" = ALL ] || echo "$files" | grep -qE "^(\.github/|scripts/ci/)|$1"
+          }
+          part '^(app/|migrations/|tests/|requirements|pyproject\.toml|alembic\.ini)' && b=true || b=false
+          part '^(src/|index\.html|package|vite\.config|eslint\.config)' && f=true || f=false
+          part '^(infra/|scripts/)' && i=true || i=false
+          printf 'backend=%s\nfrontend=%s\ninfra=%s\n' $b $f $i >> "$GITHUB_OUTPUT"
+          echo "| Part | Runs |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          printf '| backend tests | %s |\n| frontend build | %s |\n| Terraform validate | %s |\n' $b $f $i >> $GITHUB_STEP_SUMMARY
+
+  backend-tests:
+    name: "CI: backend lint and tests"
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: faults
+          POSTGRES_PASSWORD: faults
+          POSTGRES_DB: faults
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U faults" --health-interval 2s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://faults:faults@localhost:5432/faults
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt defusedxml==0.7.1
+      - name: Static analysis (Ruff)
+        run: |
+          ruff check . --output-format=json > ruff.json || true
+          ruff check . --output-format=concise || true
+          $SUMMARY ruff ruff.json "$(ruff --version | cut -d' ' -f2)"
+      - name: Migrations apply cleanly
+        if: ${{ !cancelled() }}
+        run: alembic upgrade head && alembic downgrade base
+      - name: API tests (pytest)
+        if: ${{ !cancelled() }}
+        run: |
+          pytest -v --junitxml=pytest.xml || true
+          $SUMMARY pytest pytest.xml "$(pytest --version | cut -d' ' -f2)"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: backend-reports
+          path: |
+            ruff.json
+            pytest.xml
+
+  frontend-build:
+    name: "CI: frontend lint and build"
+    needs: changes
+    # Main always builds: the release bundle needs the compiled frontend.
+    if: needs.changes.outputs.frontend == 'true' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Static analysis (ESLint)
+        run: |
+          npx eslint . -f json -o eslint.json || true
+          npx eslint . || true
+          $SUMMARY eslint eslint.json "$(npx eslint --version)"
+      - name: Production build
+        run: npm run build
+      - uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: .artifacts/dist
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: frontend-reports
+          path: eslint.json
+
+  security-scan:
+    name: "CI: security analysis"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+      TRIVY_VERSION: "0.76.1"
+      SEMGREP_VERSION: "1.182.1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # gitleaks scans the whole history, not only the last commit
+      # No pip cache here: its restore time varied from 2 s to 15 s and saved
+      # nothing on average, while a direct install takes a steady 16-18 s.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install Python scanners
+        run: pip install -r scripts/ci/requirements-security.txt
+      - name: Restore scanner binaries and Trivy checks
+        id: scanner-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/scanners
+            ~/.cache/trivy
+          key: scanners-gitleaks-${{ env.GITLEAKS_VERSION }}-trivy-${{ env.TRIVY_VERSION }}
+      - name: Download scanner binaries
+        if: steps.scanner-cache.outputs.cache-hit != 'true'
+        # Binaries are downloaded from their official releases and checked
+        # against the published checksums before use.
+        run: |
+          mkdir -p ~/scanners && cd /tmp
+          base=https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION
+          curl -fsSLO $base/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
+          curl -fsSLO $base/gitleaks_${GITLEAKS_VERSION}_checksums.txt
+          sha256sum --check --ignore-missing gitleaks_${GITLEAKS_VERSION}_checksums.txt
+          tar -xzf gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz gitleaks
+          base=https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION
+          curl -fsSLO $base/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz
+          curl -fsSLO $base/trivy_${TRIVY_VERSION}_checksums.txt
+          sha256sum --check --ignore-missing trivy_${TRIVY_VERSION}_checksums.txt
+          tar -xzf trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz trivy
+          mv gitleaks trivy ~/scanners/
+      - name: Put scanners on PATH
+        run: echo "$HOME/scanners" >> $GITHUB_PATH
+      - name: Python code security (Bandit)
+        if: ${{ !cancelled() }}
+        run: |
+          bandit -r app -f json -o bandit.json || true
+          bandit -r app -f screen || true
+          $SUMMARY bandit bandit.json "1.9.4"
+      - name: Python dependencies (pip-audit)
+        if: ${{ !cancelled() }}
+        run: |
+          pip-audit -r requirements.txt -f json -o pip-audit.json || true
+          pip-audit -r requirements.txt || true
+          $SUMMARY pip-audit pip-audit.json "2.10.1"
+      - name: npm dependencies (npm audit)
+        if: ${{ !cancelled() }}
+        run: |
+          npm audit --package-lock-only --json > npm-audit.json || true
+          npm audit --package-lock-only || true
+          $SUMMARY npm-audit npm-audit.json "$(npm --version)"
+      - name: Code security patterns (Semgrep)
+        if: ${{ !cancelled() }}
+        run: |
+          semgrep scan --metrics=off --config p/default --json -o semgrep.json app src migrations scripts || true
+          semgrep scan --metrics=off --config p/default app src migrations scripts || true
+          $SUMMARY semgrep semgrep.json "$SEMGREP_VERSION"
+      - name: Infrastructure misconfiguration (Trivy)
+        if: ${{ !cancelled() }}
+        run: |
+          trivy config --quiet -f json -o trivy.json infra/terraform || true
+          trivy config --quiet infra/terraform || true
+          $SUMMARY trivy trivy.json "$TRIVY_VERSION"
+      - name: Committed secrets (Gitleaks)
+        if: ${{ !cancelled() }}
+        run: |
+          gitleaks git --no-banner --report-format json --report-path gitleaks.json . || true
+          $SUMMARY gitleaks gitleaks.json "$GITLEAKS_VERSION"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: security-reports
+          path: "*.json"
+
+  terraform-validate:
+    name: "CI: Terraform validate"
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - name: Format and validate
+        working-directory: infra/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate
+          echo "| Tool | Version | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| terraform fmt + validate | $TERRAFORM_VERSION | **PASS** |" >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    name: "CD: deploy to AWS"
+    needs: [backend-tests, frontend-build, security-scan, terraform-validate]
+    # Only main deploys (a push, or a manual run after a lab restart).
+    # Pull requests never deploy. While the lab is stopped the session token
+    # has expired, so this job fails at the account check and changes nothing.
+    # A CI job skipped because its part did not change counts as passed.
+    if: >-
+      !cancelled() &&
+      !contains(needs.*.result, 'failure') &&
+      needs.frontend-build.result == 'success' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Check the target AWS account
+        run: |
+          actual=$(aws sts get-caller-identity --query Account --output text)
+          if [ "$actual" != "$EXPECTED_AWS_ACCOUNT_ID" ]; then
+            echo "Credentials belong to a different AWS account; stopping before any change."
+            exit 1
+          fi
+          echo "Deploying to the expected AWS account."
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - name: Terraform apply
+        working-directory: infra/terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=fault-register-tfstate-$EXPECTED_AWS_ACCOUNT_ID" \
+            -backend-config="region=$AWS_REGION"
+          terraform apply -auto-approve -input=false
+          echo "INSTANCE_ID=$(terraform output -raw instance_id)" >> $GITHUB_ENV
+          echo "BUCKET=$(terraform output -raw release_bucket)" >> $GITHUB_ENV
+          echo "APP_URL=$(terraform output -raw app_url)" >> $GITHUB_ENV
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: .artifacts/dist
+      # A manual run can redeploy a bundle that is already in S3, for example
+      # to roll forward or to rehearse a failed release through CD.
+      - name: Use an existing release bundle from S3
+        if: inputs.release_id != ''
+        env:
+          INPUT_RELEASE: ${{ inputs.release_id }}
+        run: |
+          if ! [[ "$INPUT_RELEASE" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+            echo "release_id may only contain letters, digits, dot, dash and underscore"
+            exit 1
+          fi
+          aws s3api head-object --bucket "$BUCKET" --key "releases/$INPUT_RELEASE.tar.gz" >/dev/null
+          echo "RELEASE_ID=$INPUT_RELEASE" >> $GITHUB_ENV
+      - name: Package release
+        if: inputs.release_id == ''
+        run: |
+          RELEASE_ID=${GITHUB_SHA::12}
+          echo "RELEASE_ID=$RELEASE_ID" >> $GITHUB_ENV
+          mkdir -p bundle/backend bundle/infra
+          cp -r app migrations alembic.ini requirements.txt bundle/backend/
+          # EC2 has no internet access, so the exact wheels for its Python 3.12
+          # (x86_64 Linux) travel inside the release bundle.
+          pip download --quiet --only-binary=:all: --platform manylinux2014_x86_64 \
+            --python-version 3.12 --implementation cp -r requirements.txt -d bundle/wheels
+          cp -r .artifacts/dist bundle/dist
+          cp -r scripts bundle/scripts
+          cp -r infra/nginx infra/systemd bundle/infra/
+          echo "RELEASE_ID=$RELEASE_ID" > bundle/release.env
+          tar -czf release.tar.gz -C bundle .
+          aws s3 cp release.tar.gz "s3://$BUCKET/releases/$RELEASE_ID.tar.gz"
+      - name: Install on EC2 through SSM
+        run: |
+          dir=/opt/fault-register/releases/$RELEASE_ID
+          command_id=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Deploy $RELEASE_ID" \
+            --parameters "commands=[\"set -e\",\"mkdir -p $dir\",\"aws s3 cp s3://$BUCKET/releases/$RELEASE_ID.tar.gz - | tar -xz -C $dir\",\"bash $dir/scripts/deploy.sh $RELEASE_ID\"]" \
+            --query Command.CommandId --output text)
+          status=Pending
+          while [ "$status" = Pending ] || [ "$status" = InProgress ] || [ "$status" = Delayed ]; do
+            sleep 5
+            status=$(aws ssm get-command-invocation --command-id "$command_id" \
+              --instance-id "$INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
+          done
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+            --query '[StandardOutputContent, StandardErrorContent]' --output text
+          echo "| Release | SSM status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| $RELEASE_ID | **$status** |" >> $GITHUB_STEP_SUMMARY
+          [ "$status" = Success ]
+      - name: Smoke test the deployed application
+        run: bash scripts/smoke-test.sh "$APP_URL" "$RELEASE_ID"
