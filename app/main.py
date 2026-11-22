@@ -3,7 +3,6 @@
 import os
 from datetime import date
 from typing import Literal
-
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from sqlalchemy import case, func, select, text
 from sqlalchemy.orm import Session
